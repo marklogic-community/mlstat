@@ -1,0 +1,1998 @@
+#!/bin/bash
+#set -x
+# mlstat runs iostat in the background to get the most accurate data
+trap "kill -9 -$$" INT TERM SIGKILL
+tabs 1,15,23,31,39,47,55,63,71,79,87,95,103,111,119,127,135,143,151,159,167,175,183,191,199,207,215,223,231,239,247,255,263,271,279,287,295,303,311,319,327,335,343,351,359,367,375,383,391,399,407,415,423,431,439,447,455,463,471,479,487,495,503,511,519,527,535,543,551,559,567,575,583,591,599,607,615,623,631,639,647,655,663,671,679,687,695,703,711,719 
+#
+# mlstat
+# By Denis Sheahan, MarkLogic
+#
+# Introduction
+# mlstat is a command line tool that monitors various aspects of MarkLogic Server performance.  
+# It is runs on the MarkLogic node itself and is modeled on the classic Unix tools like 
+# vmstat and mpstat.  It is designed to be always on, running in the background redirecting 
+# it's output to a file.  It has the ability to tag each line of output with an Epoch or 
+# timestamp so the data can be correlated with an event
+#
+# 
+# Design
+# ------
+# mlstat is a bash script that calls other tools at regular intervals, compares the data 
+# with its previous sample and normalizes it on a per second basis.  The tools it uses are
+# 
+# o xquery script stats.xqy to get 
+#     docs inserted, 
+#     forests, 
+#     stands, 
+#     active_merges, 
+#     merge_read_bytes, 
+#     merge_write_bytes, 
+#     journal_write_bytes, 
+#     save_write_bytes
+#     in memory-mb, 
+#     on disk size
+#     backup and restore stats
+#     replication network stats
+#     load values as seen by ML
+# o xquery script http-server-status.xqy to get stats about a HTTP or xdbc server
+# o xquery get-hosts.xqy to get a list of hosts
+# o iostat to get disk and cpu performance data
+# o vmstat  to get runnable and blocked processes, swap in/out and context switch performance data
+# o pmap  to get memory sizes for anon and mapped files
+# o /proc  to get memory sizes forthe MarkLogic process
+# o ifconfig to calculate network bandwidth
+# o The MarkLogic  log for interesting events such as saves and merges
+#
+# Assumptions
+# -----------
+# mlstat currently only runs on Linux machines
+# mlstat assumes that iostat, pmap and vmstat are available on the system ie the sysstat package has been installed
+# mlstat assumes that iostat, vmstat and ifconfig are in the users $PATH
+# mlstat assumes that the xquery file stats.xqy has been installed in the MarkLogic/Admin directory
+# if not mlstat will exit
+# To display database statistics obviously MarkLogic needs to be running
+#
+#
+# Use the -h flag for options
+#
+# OPTIONS:
+# Database stats
+#   -d <database>  Database to monitor
+#   -j             Journal stats
+#   -s             Save Stats
+#   -m             Merge stats
+#   -a             In-memory and disk sizes
+#   -g             Docs Ingested, Deletes, Re-indexes, stands
+#   -q             Query mb
+#   -c             Forest cache stats
+#   -v             Verbose cache stats
+#   -I             ML view of I/O
+#   -B             Backup and Restore stats
+#   -R             Replication Send and Receive stats
+#   -l <file location> Location of log for scraping
+#   -b <filename>  Dump log events to a seperate file
+#   -L             Dump log events to stdout
+#   -o <http-server> Http server stats
+#   -x <xdbc-server> xdbc server stats
+#   -r             Dump stats for Replica forests not regular
+# System stats
+#   -y             Linux stats - cpu, runnables, blocked,swap
+#   -n <network name> Network interface to monitor
+#   -k <disk name> Stripe or disk to monitor
+#   -A             Aggregate all the disk stats into 1 number
+#   -M             Dump memory stats from pmap of the MarkLogic process (requires root)
+#   -S             Dump memory stats from /proc of MarkLogic process
+# Control
+#   -U <name>      ML User name other than admin
+#   -P <passwd>    ML Passwd other than admin
+#   -f             Dump stats in comma seperated list for csv
+#   -e             Include Epoch per line
+#   -t             Include Timestamp per line
+#   -i <interval>  Set interval, default 10
+#   -p <count>     Number of samples to take
+#   -H <hostname>  Dumps stats for just one host in cluster
+#   -N <hostname>  Run mlstat on this node, default is localhost
+#   -C <comment>   Prepend this comment to each line
+#   -X             Suppress headers
+#   -D             Include Date in timestamp
+# 
+#
+# 
+#
+# Running mlstat
+# --------------
+# The only required flag is -d <database-name> if you are tracking one of the database
+# statistics.  The -d parameter specifies which database to extract performance data
+# from.  
+#
+# However no flags means no data!  There is no set of default data
+#
+# By default mlstat prints on a 10 second interval.  Use the -i <interval> flag to change this.
+# mlstat measures the actual interval taken and uses this value for all rate stats calculated
+#
+# It is recomended to add a timestamd to each line of mlstat output making it possible to plot
+# results later and pinpoint performance issues (use the -e, -t or -D flags)
+#
+# Due to the potential size of the Error Log, checking the log is not enabled by default
+# However if you specify the -s (saves) or -m (merges) flags the ErrorLog file will be 
+# scraped to get save and merge counts on this node
+#
+# Like other tools mlstat dumps a header every 10 samples, to supress this header specify the -X
+# flag
+#
+# Also like other tools you can restrict the number of samples to collect with the -p flag
+# 
+# mlstat can be run on multiple nodes at the same time.  In this mode it is highly recommended to use
+# -H <node name> to collect the data for that particular node.
+# 
+# Sections of mlstat output
+# --------------------------
+# If the -e flag is specified mlstat will print the Linux epoch at the start of every line
+# This is extremely useful for plotting data
+#
+#	Epoch
+#	1351829932
+#	1351829937
+# 
+# Specifying -t will convert this epoch to timestamp from the Linux date command
+#
+#	Time
+#	10:40:57
+#	10:41:07
+#	10:41:17
+#
+# Specifying -D will emit both a date a time, handy for tests that run over a number of days
+#
+#       Time
+#       2012-11-20 14:39:37
+#       2012-11-20 14:39:43
+#       
+# The Log File
+# ------------
+#
+# By using the -b or -L flags Save and Merge events written to the MarkLogic log can be printed by mlstat
+#
+#	2012-11-02 16:18:07.718 Info: Merged 1 MB in 10 sec at 0 MB/sec to /var/opt/MarkLogic/Forests/App-Services/00000002
+#	2012-11-05 10:49:11.139 Info: Saved 147 MB in 4 sec at 40 MB/sec to /space/mldata/Forests/cpox-1-5/00000000
+#
+# Using -b <filename> option to redirect this output to a file
+# Using -L prints this output to standard out
+# 
+# If for some reason teh ErrorLog is being written to a different location use -l <log-file-name> to indicate this to mlstat
+# 
+# As mentioned previosly if -m or -s flags are used then the log file will be scraped to get counts
+# of merges and saves respectively
+#
+# mlstat Sections
+# ---------------
+# mlstat can print many different stats in any combination by specifying various flags
+#
+# In addition by specifying -H <node name> just the ML stats for the specified node will be printed
+# It is important to use the fully qualified nodename eg foobar.marklogic.com as defined in the cluster
+# or the cannot be extracted
+#
+# Journal Stats -j flag
+# ---------------------
+#
+# The -j option simply prints the MB/s of journal files written to disk.  By default this is for all nodes
+# -H <node name> specifies a particular node
+#
+#   	J-MB/s
+#	55
+#	72
+#	74
+#
+# Save Stats -s flag
+# ------------------
+#
+# The -s option prints the number of saves of in-memory stands to disk and the MB/s of Save data for the cluster
+# Again by default this is for all forests, -H <nodename> for a single node
+#
+#	NumSv	Sv-MB/s
+#	3	135
+#	3	190
+#	6	49
+#
+# Merge Stats -m flag
+# -------------------
+# The -m option prints the number of Merges currently active (A-Mergs), completed in the last period (C-Mergs) and
+# the MBs per second Reads and Writes for merges across the entire cluster
+#
+#	A-Mergs	C-Mergs	M-rMB/s	M-wMB/s
+#	12	0	140	133
+#	12	0	130	126
+#	12	0	133	127
+#
+# Note the Merge-rMB/s usually does not equal Disk I/O and a good percentage of the reads will be satisfied by the
+# Linux filesystem cache
+#
+# Sizing Stats -a flag
+# --------------------
+#
+# The -a option dumps the size the in-memory stands and the current size of the stands on disk
+# Again if -H <nodename> is used then only the space for that node is displayed
+#
+#	Mem-MB	Disk-MB
+#	13551	3726
+#	12300	4379
+#	8478	5653
+#
+# Docs Ingested, Deletes, Re-indexes, stands per second -g flag
+# -------------------------------------------------------------
+#
+# The -g flag dumps Docs ingested, Deleted and Re-indexed  per second and current Stands in the database
+# 
+# Docs/s	Del/s	Ridx/s	Stands
+# 980		3	0	52	
+# 1494		3	0	52	
+#
+# The stand count will include both in-memory stands and on-disk stands
+#
+# Query MB per second -q flag
+# ---------------------------
+#
+# The -q flag dumps the MB per second read from disk for queries.  This is an approximation of query processing load
+# 
+# Q-MB/s
+# 52	
+# 36
+#
+# Forest Cache stats -c flag
+# --------------------------
+# 
+# With the -c flag you can dump the hit rates of the List cache (LC) and Compressed Tree Cache (CTC)
+#
+#	Epoch		%LC-Ht	%CTC-Ht
+#	1352752818	91	13
+#	1352752824	91	13
+#	1352752831	91	13
+#	1352752837	91	13
+#	1352752844	91	13
+#	1352752850	91	13
+#	1352752857	91	13
+#
+# ML View of I/O -I flag
+# ----------------------
+#
+# The -I flag gives a view of I/O from inside the MarkLogic Server
+#
+# Tt-WMB	S-iops	J-iops	MR-iops	MW-iops	T-wops	S-lat	J-lat	MR-lat	MW-lat	S-ld	J-ld	MR-ld	MW-ld	
+# 14		7	4	16	16	28	3.90	42.95	12.26	3.72	  0.04	  0.22	  0.17	  0.07	
+# 13		1	4	21	20	26	0.70	55.31	13.35	3.71	  0.02	  0.25	  0.22	  0.07	
+# 36		15	3	52	53	72	7.43	86.84	9.15	5.26	  0.07	  0.26	  0.34	  0.19	
+# 13		12	4	9	9	26	7.06	57.15	15.12	7.50	  0.08	  0.27	  0.23	  0.12	
+# 8		1	5	11	10	17	0.78	41.65	15.42	3.17	  0.04	  0.26	  0.21	  0.08	
+# 16		1	5	26	26	33	0.68	51.80	11.81	4.67	  0.02	  0.29	  0.28	  0.10	
+# 19		1	6	28	30	38	0.67	45.32	5.17	8.72	  0.01	  0.29	  0.20	  0.17	
+# 4		1	6	0	0	8	0.81	27.12	0	0	  0.01	  0.25	  0.10	  0.09	
+#
+# The fields are as follows:
+#
+# 	Tt-WMB		Total MB/s of Write for this DB
+#	S-iops		512k IOPs per second of Save of internal forests to disk
+#	J-iops		512k IOPs per second of Journal writes
+#	MR-iops		512k IOPs per second of Merge Read data
+#	MW-iops		512k IOPs per second of Merge Write data
+#	T-wops		Total 512k Write ops per second
+#	S-lat		Average latency of the Save IOPs from a MarkLogic perspective (included queuing)
+#	J-lat		Average latency of the Journal IOPs from a MarkLogic perspective (included queuing)
+#	MR-lat		Average latency of the Merge Read IOPs from a MarkLogic perspective (included queuing)
+#	MW-lat		Average latency of the Merge Write IOPs from a MarkLogic perspective (included queuing)
+#	S-ld		Save load value (from forest status)
+#	J-ld		Journal load value (from forest status)
+#	MR-ld		Merge Read load value (from forest status)
+#	MW-ld		Merge Write load value (from forest status)
+#
+#
+# Backup and Restore stats -B Flag
+# --------------------------------
+#
+# The -B flag measures the MB/s for backup and restore.  It dumps the 512KB Read and Write ops per second
+# for both backup and restore.  It also dumps MarkLogics internal measurement of load for these operations
+# Finay based on the cpu time spent on the operation it calculates latency
+#
+# During a backup the stats will look something similar to the
+#
+# B-Rdops	B-Wrops	R-Rdops	R-Wrops	B-Rdlat	B-Wrlat	R-Rdlat	R-Wrlat	B-Rdld	B-Wrld	R-Rdld	R-Wrld	
+# 0		0	0	0	0	0	0	0	  0.00	  0.00	  0.00	  0.00	
+# 0		0	0	0	0	0	0	0	  0.00	  0.00	  0.00	  0.00	
+# 0		0	0	0	0	0	0	0	  0.00	  0.00	  0.00	  0.00	
+# 30		30	0	0	12.96	2.10	0	0	  0.23	  0.04	  0.00	  0.00	
+# 43		43	0	0	17.97	10.33	0	0	  0.58	  0.26	  0.00	  0.00	
+# 43		43	0	0	20.86	42.36	0	0	  0.80	  1.19	  0.00	  0.00	
+# 75		75	0	0	22.34	41.83	0	0	  1.21	  2.10	  0.00	  0.00	
+# 72		72	0	0	25.46	33.60	0	0	  1.63	  2.50	  0.00	  0.00	
+# 
+#
+# Database Replication Send and Receive stats -R flag
+# ---------------------------------------------------
+#
+# The -R flang dumps the send and receive KB per second for database replication.  Note this does not represent
+# network traffic for local disk replication
+#
+# R-RcvKB	R-SndKB	R-Rcvlt	R-Sndlt	R-Rcvld	R-Rcvld	
+# 0		0	0	0	  0.00	  0.00	
+# 0		0	0	0	  0.00	  0.00	
+# 0		0	0	0	  0.00	  0.00	
+# 0		0	0	0	  0.00	  0.00	
+# 0		0	0	0	  0.00	  0.00	
+# 0		0	0	0	  0.00	  0.00	
+# 0		0	0	0	  0.00	  0.00	
+#
+#
+# Stats for a HTTP Server -o flag or an xdbc Server -x flag
+# ---------------------------------------------------------
+#
+# With -o <http-server-name> or -x <xdbc-server-name>,  stats from a HTTP or xdbc server can be dumped. 
+# By default the query rate, current count of outstanding requests, number of outstanding update requests,
+# active threads in the server and the Extended Tree Cache (ETC) hit rate are dumped.  Note we 
+# add the name of the HTTP/xdbc server to the heading of each field (in the example 8007-cpox)
+#
+# 	8007-cpox-Rate	8007-cpox-Cnt	8007-cpox-Upd	8007-cpox-Thr	8007-cpox-ETC
+# 	17.51		10		0		12		57
+# 	21.85		10		1		11		57
+# 	15.83		10		0		11		57
+# 	13.02		10		0		12		57
+# 	12.17		10		0		11		57
+# 	10.04		10		0		11		57
+# 	9.17		10		0		11		57
+# 	8.71		10		0		11		57
+#
+# In addition adding the -v flag dumps statistics for the other caches (fs program cache,db program cache,env program cache
+# fs main module sequence cache, db main module sequence cache, fs library module cache, db library module cache)
+# These caches do not tend to be an issue and are included for completeness.
+#
+#	8007-cpox-FPC	8007-cpox-DPC	8007-cpox-EPC	8007-cpox-FMMSC	8007-cpox-DMMSC	8007-cpox-FLMC	8007-cpox-DLMC
+#	50		50		0		0		50		0		50		0
+#	58		50		0		0		50		0		50		0
+#	58		50		0		0		50		0		50		0
+#	58		50		0		0		50		0		50		0
+#	58		50		0		0		50		0		50		0
+#	58		50		0		0		50		0		50		0
+#	58		50		0		0		50		0		50		0
+#
+# Note xcc AppServers do not have an env program cache
+#
+#
+#
+#
+# System stats -y flag
+# --------------------
+# 
+# The -y flag dumps the breakdown of cpu time spent, runnable and blocked processes, swap in and out
+# and context switches per second for this node.
+#
+# For cpu breakdown There is percent user, nice, system,idle, 
+# iowait and steal.  The nice percentage is an indication of how much cpu is being spent on merges
+# 
+# %user   %nice	%system %idle   %iowait %steal	Runble	Blcked	Swp-in	Swp-out	CntxS
+#  0.93     10.0  0.36  88.56    0.00    0.15	50	1	0	0	36536
+#  1.16     12.0  0.34  88.35    0.00    0.15	39	0	0	0	34493
+#  0.84     10.5  0.39  88.59    0.00    0.19   38	0	0	0	34988
+#  1.69     11.7  0.55  87.57    0.00    0.19	39	0	0	0	35180
+#
+# The Runnable field indicates how many threads are in the queue for cpu and blocked are those waiting
+#
+# Disk I/O -k flag
+# ----------------
+# By specifying -k <disk-name> mlstat will dump  the I/O statistics on this node.  
+# The device can be a stripe such as md0 or individual disks such as /dev/xvdl.  
+# 
+# xvdl-rs	ws	rMBs	wMBs	svct	%utl	
+# 17.74	90.95	0.57	3.59	1.19	12.94	
+# 10.57	62.11	0.04	2.34	1.31	9.53	
+# 8.50	62.20	0.03	2.33	1.08	7.64	
+# 9.70	56.80	0.04	2.06	1.07	7.12
+#
+# Users can specify multiple disks using the | character.  Note the | must be escaped on Linux so the 
+# command would be -k xvdl\|xvdm
+#
+# xvdl-rs	ws	rMBs	wMBs	svct	%utl	xvdm-rs	ws	rMBs	wMBs	svct	%utl	
+# 17.61		91.31	0.56	3.60	1.19	12.95	16.66	90.05	0.52	3.55	1.45	15.51	
+# 29.60		282.30	0.90	11.15	0.97	30.28	9.20	45.10	0.04	1.68	1.97	10.72	
+# 7.70		241.10	0.03	9.56	1.16	28.84	6.80	49.70	0.03	1.84	1.83	10.32	
+# 7.30		282.80	0.03	11.24	1.04	30.24	7.00	47.00	0.03	1.68	4.27	23.04
+# 
+#
+# Aggregate Disk I/O -A flag
+# --------------------------
+#
+# If multiple disks are specified then the -A flag can be included to aggregate the data from all
+# these disks.  We do the following for each field
+#
+#	rs (reads per second)		: Accumulate values for all disks
+#	ws (writes per second)		: Accumulate values for all disks
+#	rMBs (reads MB per second)	: Accumulate values for all disks
+#	wMBs (writes MB per second)	: Accumulate values for all disks
+#	svct (Service time)		: Average from all disks
+#	%utl (Percent Utilization)	: Average from all disks
+# 
+# rds	wrs	rMBs	wMBs	svct	%utl	
+# 34	183	1.07	7.25	1.32	14.41	
+# 17	389	0.07	15.54	1.40	28.25	
+# 11	375	0.05	14.86	1.44	27.88	
+# 11	351	0.04	13.91	1.33	24.14	
+# 18	376	0.08	14.79	1.28	25.48	
+# 19	533	0.08	21.07	1.36	36.74	
+# 35	644	0.96	25.54	1.48	48.22	
+# 13	296	0.06	11.54	1.65	24.18	
+
+# Network I/O -n flag
+# -------------------
+# By specifying -n <network device> mlstat will dump the Network Bandwidth in Kbits per second
+# 
+# NetRxKb NetTxKb
+# 23866   51476
+# 23058   36835
+# 19896   35025
+#
+# Memory stats using pmap -M flag
+# -------------------------------
+#
+# The -M flag uses the Linux utility pmap to determine how much memory have been allocated to Anon and Memory
+# mapped files in the MarkLogic process.  For each it has two fields,  memory in MB requested and the current
+# Resident Set Size (RSS) of the allocation.  The RSS indicates how much memory Linux has actually assigned.
+#
+# A-MB	A-RSS	MM-MB	MM-RSS	Tot-MB	Tot-RSS	
+# 5779	2376	229	85	6167	2486	
+# 5783	2413	235	92	6177	2529	
+# 5783	2446	235	92	6177	2562	
+# 5823	2483	236	92	6219	2600	
+# 5819	2520	236	92	6215	2637
+#
+#
+# Memory stats using /proc -S flag
+# --------------------------------
+#
+# On some Linux systems, notably Red Hat, you need root permission to use pmap on the MarkLogic daemon process.
+# As an alternative most of the same data can be accquired via /proc.  The -S flag uses /proc to collect RSS
+# and process size information
+#
+# Pk-MB	Sz-MB	HWM-MB	RSS-MB	Data-MB	
+# 7729	6160	3401	2538	5778	
+# 7729	6163	3401	2574	5781	
+# 7729	6163	3401	2612	5781	
+# 7729	6201	3401	2648	5818	
+#
+# The meaning of each of these fields is as follows
+#
+# 	Pk MB		: /proc VmPeak value, peak VM size of the MarkLogic process
+#	Sz-MB		: /proc VmSize value, current VM size of the MarkLogic process
+#	HWM-MB		: /proc VmHWM value, peak RSS for the MarkLogic process
+#	RSS-MB		: /proc VmRSS value, current RSS for the MarkLogic process
+#	Data-MB		: /proc VmData value, size of data segment for the MarkLogic process
+#
+#  **********************************************************************************************
+#  **********************************************************************************************
+# Note cpu, disk and network stats are only for the ML node running mlstat ie -H <nodename> does not
+# work for these stats.   -H will work with all other stats
+#  **********************************************************************************************
+#  **********************************************************************************************
+# 
+#
+#
+#
+#
+# Examples:
+#
+# ./mlstat -d cpox -g
+#
+# Monitor the ingest rate and stand count for the database cpox
+#
+# ./mlstat -d cpox -g -t
+#
+# Monitor the ingest rate and stand count for the database cpox with a timestamp on each line
+#
+#  ./mlstat -d cpox -g -t -j -m -s
+#
+# Monitor the ingest rate, Journal MB/s, Merge read and write MB/s, Save MB/s  and stand count for 
+# the database cpox with a timestamp on each line
+#
+#  ./mlstat -d cpox -g -t -j -m -s -y
+#
+# Monitor the ingest rate, Journal MB/s, Merge read and write MB/s, Save MB/s  and stand count for 
+# the database cpox.  Add the cpu stats for this node.  With a timestamp on each line
+#
+#  ./mlstat -d cpox -g -t -j -m -s -y -i 60
+#
+# Monitor the ingest rate, Journal MB/s, Merge read and write MB/s, Save MB/s  and stand count for 
+# the database cpox.  Add the cpu stats and for this node.  With a timestamp on each line and set 
+# the interval to every 60 seconds
+#
+#  ./mlstat -d cpox -g -t -j -m -s -y -i 60 -n eth0
+#
+# Monitor the ingest rate, Journal MB/s, Merge read and write MB/s, Save MB/s  and stand count for 
+# the database cpox.  Monitor the cpu stats and network eth0 for this node.  With a timestamp on each line and set 
+# the interval to every 60 seconds
+#
+# ./mlstat -d cpox -B
+#
+# Monitor the Backup and Restore I/O for the database cpox
+#
+# ./mlstat -d cpox -R
+#
+# Monitor the Database replication network traffic for the cpox database
+#
+# ./mlstat -d cpox -I
+#
+# Dump MarkLogics view of I/O for the cpox database
+#
+# ./mlstat -k xvdl\|xvdm
+#
+# Monitor two disks, xvdl and xvdm on this server
+#
+# ./mlstat -k xvdl\|xvdm -A
+#
+# Monitor two disks, xvdl and xvdm on this server but accumulate their stats
+#
+# ./mlstat  -M
+# 
+# Monitor the memory usage of the MarkLogic daemon using pmap
+#
+#  ./mlstat  -S
+#
+# Monitor the memory usage of the MarkLogic daemon using /proc
+#
+# ./mlstat -d cpox   -x 9000-xcc 
+#
+# Monitor the XDBC server 9000-xcc on the database cpox
+#
+# ./mlstat -d cpox   -x 9000-xcc  -v
+#
+# Monitor the XDBC server 9000-xcc on the database cpox and add its cache hit rates
+
+
+
+
+usage()
+{
+cat << EOF
+usage: $0 options
+
+ OPTIONS:
+ Database stats
+   -d <database>  Database to monitor
+   -j             Journal stats
+   -s             Save Stats
+   -m             Merge stats
+   -a             In-memory and disk sizes
+   -g             Docs Ingested, Deletes, Re-indexes, stands
+   -q             Query mb
+   -c             Forest cache stats
+   -v             Verbose cache stats
+   -I             ML view of I/O
+   -B             Backup and Restore stats
+   -R             Replication Send and Receive stats
+   -l <file location> Location of log for scraping
+   -b <filename>  Dump log events to a seperate file
+   -L             Dump log events to stdout
+   -o <http-server> Http server stats
+   -x <xdbc-server> xdbc server stats
+   -r             Dump stats for Replica forests not regular
+ System stats
+   -y             Linux stats - cpu, runnables, blocked,swap
+   -n <network name> Network interface to monitor
+   -k <disk name> Stripe or disk to monitor
+   -A             Aggregate all the disk stats into 1 number
+   -M             Dump memory stats from pmap of the MarkLogic process (requires root)
+   -S             Dump memory stats from /proc of MarkLogic process
+ Control
+   -U <name>      ML User name other than admin
+   -P <passwd>    ML Passwd other than admin
+   -f             Dump stats in comma seperated list for csv
+   -e             Include Epoch per line
+   -t             Include Timestamp per line
+   -i <interval>  Set interval, default 10
+   -p <count>     Number of samples to take
+   -H <hostname>  Dumps stats for just one host in cluster
+   -N <hostname>  Run mlstat on this node, default is localhost
+   -C <comment>   Prepend this comment to each line
+   -X             Suppress headers
+   -D             Include Date in timestamp
+ 
+EOF
+}
+
+
+header()
+{
+if  [ $date_timestamp_include -eq 1 ]
+then
+if [ $orca -eq 1 ]
+ then
+      printf "DateTime," 
+   else
+      printf "DateTime\t" 
+   fi 
+
+#   if [ $date_timestamp_include -eq 1 ] 
+#   then
+#   if [ $orca -eq 1 ]
+#   then
+#      printf ","
+#   else
+#      printf "\t"
+#   fi
+#
+#   fi
+fi
+
+if [ $timestamp_include -eq 1 ] 
+then
+if [ $orca -eq 1 ]
+ then
+      printf "Time," 
+   else
+      printf "Time\t" 
+   fi 
+
+#   if [ $date_timestamp_include -eq 1 ] 
+#   then
+#   if [ $orca -eq 1 ]
+#   then
+#      printf ","
+#   else
+#      printf "\t"
+#   fi
+#
+#   fi
+fi
+
+if [ $epoch_include -eq 1 ]
+then
+   if [ $orca -eq 1 ]
+   then
+       printf "Epoch,"
+   else
+       printf "Epoch\t"
+   fi
+
+fi
+
+if [ "$comment" != "" ] && [ $orca -eq 1 ]
+then
+   printf "Comment,"
+fi
+
+
+if [ $doc_stats -eq 1 ]
+then
+   if [ $orca -eq 1 ]
+   then
+      printf "Docs/s,Del/s,Ridx/s,Stands," 
+   else
+      printf "Docs/s\tDel/s\tRidx/s\tStands\t" 
+   fi
+fi
+if [ $query_stats -eq 1 ]
+then
+   if [ $orca -eq 1 ]
+   then
+      printf "Q-MB/s," 
+   else
+      printf "Q-MB/s\t" 
+   fi
+fi
+
+if [ $forest_stats -eq 1 ]
+then
+   if [ $orca -eq 1 ]
+   then
+      printf "%%LC-Ht,%%CTC-Ht," 
+   else
+      printf "%%LC-Ht\t%%CTC-Ht\t" 
+   fi
+fi
+
+
+if [ "$net_name" != "" ]
+then
+  real_net=`/sbin/ifconfig $net_name 2>&1 | awk ' BEGIN{found=1} /Device not found/ {found= 0} END{print found}'`
+else
+  real_net=0;
+fi
+
+# Print cpu stats header
+
+if [ $sys_stats -eq 1 ]
+then
+
+   if [ $orca -eq 1 ]
+   then
+     printf "%%user,%%nice,%%system,%%idle,%%iowait,%%steal,"
+   else
+     printf "%%user\t%%nice\t%%system\t%%idle\t%%iowait\t%%steal\t"
+   fi
+# Print runable, blocked, swap in/swap out and context switches
+
+   if [ $orca -eq 1 ]
+   then
+     printf "Rnble,Blcked,Swp-in,Swp-out,CntxS,"
+   else
+     printf "Runble\tBlcked\tSwp-in\tSwp-out\tCntxS\t"
+   fi
+fi
+
+if [ "$disk_name" != "" ]
+then
+  if [ $accumulate_disks -eq 0 ]
+  then
+
+   # Print disks stats header can be multiple disks
+   if [ $orca -eq 1 ]
+   then
+     echo $disk_name | awk ' BEGIN{FS="|"}{for (i=1;i<=NF;i++) {printf "%s-rs,ws,rMBs,wMBs,svct,%%utl,",$i}}'
+   else
+     echo $disk_name | awk ' BEGIN{FS="|"}{for (i=1;i<=NF;i++) {printf "%s-rs\tws\trMBs\twMBs\tsvct\t%%utl\t",$i}}'
+   fi
+  else
+   # Print disks stats header can be multiple disks
+   if [ $orca -eq 1 ]
+   then
+     printf "rds,wrs,rMBs,wMBs,svct,%%utl,"
+   else
+     printf "rds\twrs\trMBs\twMBs\tsvct\t%%utl\t"
+   fi
+  fi
+fi
+
+
+
+if [ "$net_name" != "" ]
+then
+# Print the network header
+
+   if [ $orca -eq 1 ]
+   then
+     printf "NtRxKb,NtTxKb,"
+   else
+     printf "NtRxKb\tNtTxKb\t"
+   fi
+fi
+
+
+
+if [ $journal -eq 1 ]
+then
+   if [ $orca -eq 1 ]
+   then
+       printf "J-MB/s,"
+   else
+       printf "J-MB/s\t"
+   fi
+fi
+
+
+if [ $saves -eq 1 ]
+then
+   if [ $orca -eq 1 ]
+   then
+     printf "NumSv,Sv-MB/s,"
+   else
+     printf "NumSv\tSv-MB/s\t"
+   fi
+fi
+
+if [ $merges -eq 1 ]
+then
+   if [ $orca -eq 1 ]
+   then
+      printf "A-Mergs,C-Mergs,M-rMB/s,M-wMB/s,"
+   else
+      printf "A-Mergs\tC-Mergs\tM-rMB/s\tM-wMB/s\t"
+   fi
+fi
+
+if [ $sizes -eq 1 ]
+then
+   if [ $orca -eq 1 ]
+   then
+      printf "Mem-MB,Disk-MB,"
+   else
+      printf "Mem-MB\tDisk-MB\t"
+   fi
+fi
+
+if [ "$http" != "" ]
+then
+   if [ $orca -eq 1 ]
+   then
+      printf "%s-Rate,%s-Cnt,%s-Upd,%s-Thr,%s-ETC," $http  $http  $http  $http  $http
+      if [ $verbose_stats -eq 1 ]
+      then
+        printf "%s-FPC,%s-DPC,%s-EPC,%s-FMMSC,%s-DMMSC,%s-FLMC,%s-DLMC," $http  $http  $http  $http  $http  $http  $http  
+      fi
+   else
+      printf "%s-Rate\t%s-Cnt\t%s-Upd\t%s-Thr\t%s-ETC\t" $http  $http  $http  $http  $http
+      if [ $verbose_stats -eq 1 ]
+      then
+        printf "%s-FPC\t%s-DPC\t%s-EPC\t%s-FMMSC\t%s-DMMSC\t%s-FLMC\t%s-DLMC\t" $http  $http  $http  $http  $http  $http  $http  
+      fi
+   fi
+fi
+
+if [ "$xdbc" != "" ]
+then
+   if [ $orca -eq 1 ]
+   then
+      printf "%s-Rate,%s-Cnt,%s-Upd,%s-Thr,%s-ETC," $xdbc  $xdbc  $xdbc  $xdbc  $xdbc
+      if [ $verbose_stats -eq 1 ]
+      then
+        printf "%s-FPC,%s-DPC,%s-FMMSC,%s-DMMSC,%s-FLMC,%s-DLMC," $xdbc  $xdbc  $xdbc  $xdbc  $xdbc  $xdbc  
+      fi
+   else
+      printf "%s-Rate\t%s-Cnt\t%s-Upd\t%s-Thr\t%s-ETC\t" $xdbc  $xdbc  $xdbc  $xdbc  $xdbc
+      if [ $verbose_stats -eq 1 ]
+      then
+        printf "%s-FPC\t%s-DPC\t%s-FMMSC\t%s-DMMSC\t%s-FLMC\t%s-DLMC\t" $xdbc  $xdbc  $xdbc  $xdbc  $xdbc  $xdbc  
+      fi
+   fi
+fi
+
+
+if [ $do_proc_memory -eq 1 ]
+then
+   if [ $orca -eq 1 ]
+   then
+      printf "A-MB,A-RSS,MM-MB,MM-RSS,Tot-MB,Tot-RSS,"
+   else
+      printf "A-MB\tA-RSS\tMM-MB\tMM-RSS\tTot-MB\tTot-RSS\t"
+   fi
+fi
+
+if [ $do_proc_status -eq 1 ]
+then
+   if [ $orca -eq 1 ]
+   then
+      printf "Pk-MB,Sz-MB,HWM-MB,RSS-MB,Data-MB,"
+   else
+      printf "Pk-MB\tSz-MB\tHWM-MB\tRSS-MB\tData-MB\t"
+   fi
+
+fi
+if [ $ml_extended_io -eq 1 ]
+then
+   if [ $orca -eq 1 ]
+   then
+      printf "Tt-WMB,S-iops,J-iops,MR-iops,MW-iops,T-wops,S-lat,J-lat,MR-lat,MW-lat,S-ld,J-ld,MR-ld,MW-ld,"
+   else
+      printf "Tt-WMB\tS-iops\tJ-iops\tMR-iops\tMW-iops\tT-wops\tS-lat\tJ-lat\tMR-lat\tMW-lat\tS-ld\tJ-ld\tMR-ld\tMW-ld\t"
+   fi
+
+fi
+if [ $backup_stats -eq 1 ]
+then
+   if [ $orca -eq 1 ]
+   then
+      printf "B-Rdiops,B-Wriops,R-Rdiops,R-Wriops,B-Rdlat,B-Wrlat,R-Rdlat,R-Wrlat,B-Rdld,B-Wrld,R-Rdld,R-Wrld,"
+   else
+      printf "B-Rdops\tB-Wrops\tR-Rdops\tR-Wrops\tB-Rdlat\tB-Wrlat\tR-Rdlat\tR-Wrlat\tB-Rdld\tB-Wrld\tR-Rdld\tR-Wrld\t"
+   fi
+
+fi
+if [ $replication_stats -eq 1 ]
+then
+   if [ $orca -eq 1 ]
+   then
+      printf "R-RcvKB,R-SndKB,R-Rcvlt,R-Sndlt,R-Rcvld,R-Rcvld,"
+   else
+      printf "R-RcvKB\tR-SndKB\tR-Rcvlt\tR-Sndlt\tR-Rcvld\tR-Rcvld\t"
+   fi
+
+fi
+
+printf "\n"
+}
+
+my_version=$$;
+epoch_include=0
+collect_mlstats=0
+log_location=/var/opt/MarkLogic/Logs/ErrorLog.txt
+timestamp_include=0
+date_timestamp_include=0
+log_updates=
+disk_name=
+net_name=
+requested_interval=10
+database=
+hostname=
+do_header=1
+journal=0
+sys_stats=0
+doc_stats=0
+query_stats=0
+forest_stats=0
+merges=0
+saves=0
+sizes=0
+verbose_stats=0
+use_dev_shm=0
+sample_count=100000
+divider="\t"
+orca=0
+do_proc_memory=0
+do_proc_status=0
+user=admin
+passwd=admin
+running_host=localhost
+comment=
+ml_extended_io=0
+accumulate_disks=0
+backup_stats=0
+replication_stats=0
+low_level_stats=
+replica_stats=no
+
+ 
+
+while getopts “ABC:DE:H:ILMN:P:RSU:Xab:cd:efghi:jk:l:mn:o:p:qrstvx:y” OPTION
+do
+     case $OPTION in
+         h)
+             usage
+             exit 1
+             ;;
+         e)
+             epoch_include=1
+             ;;
+         A)
+             accumulate_disks=1
+             ;;
+         B)
+             backup_stats=1
+             collect_mlstats=1
+             ;;
+         R)
+             replication_stats=1
+             collect_mlstats=1
+             ;;
+         f)
+             orca=1
+             ;;
+         y)
+             sys_stats=1
+             ;;
+         c)
+             forest_stats=1
+             collect_mlstats=1
+             ;;
+         v)
+             verbose_stats=1
+             collect_mlstats=1
+             ;;
+         g)
+             doc_stats=1
+             collect_mlstats=1
+             ;;
+         q)
+             query_stats=1
+             collect_mlstats=1
+             ;;
+         H)
+             hostname=$OPTARG
+             ;;
+         E)
+             low_level_stats=$OPTARG
+             collect_mlstats=1
+             ;;
+         N)
+             running_host=$OPTARG
+             ;;
+         U)
+             user=$OPTARG
+             ;;
+         P)
+             passwd=$OPTARG
+             ;;
+         C)
+             comment=$OPTARG
+             ;;
+         l)
+             log_location=$OPTARG
+             ;;
+         X)
+             do_header=0
+             ;;
+         M)
+             do_proc_memory=1
+             ;;
+         S)
+             do_proc_status=1
+             ;;
+         I)
+             ml_extended_io=1
+             collect_mlstats=1
+             ;;
+         m)
+             merges=1
+             collect_mlstats=1
+             ;;
+         j)
+             journal=1
+             collect_mlstats=1
+             ;;
+         s)
+             saves=1
+             collect_mlstats=1
+             ;;
+         a)
+             sizes=1
+             collect_mlstats=1
+             ;;
+         o)
+             http=$OPTARG
+             collect_mlstats=1
+             ;;
+         x)
+             xdbc=$OPTARG
+             collect_mlstats=1
+             ;;
+         t)
+             timestamp_include=1
+             ;;
+         D)
+             date_timestamp_include=1
+             ;;
+         b)
+             log_updates=$OPTARG
+             ;;
+         L)
+             log_updates=stdout
+             ;;
+         k)
+             disk_name=$OPTARG
+             num_disks=`echo $disk_name | awk 'BEGIN {FS="|"}{print NF}'`
+             tot_found_disks=`iostat -tmx 1 1 | awk -v disk_name="$disk_name" ' \
+                  BEGIN{found_disk=0}
+                          $0 ~ disk_name  { found_disk++;
+                          disk_list[found_disk] = $1 }
+                  END{print found_disk} ' `
+             if [ $tot_found_disks -eq 0 ] || [  $tot_found_disks -ne $num_disks ]
+             then 
+               echo "Disk name not valid"
+               exit
+             fi
+             ;;
+         n)
+             net_name=$OPTARG
+             ;;
+         i)
+             requested_interval=$OPTARG
+             ;;
+         d)
+             database=$OPTARG
+             ;;
+         p)
+             sample_count=$OPTARG
+             ;;
+         r)
+             replica_stats=yes
+             ;;
+         ?)
+             usage
+             exit
+             ;;
+     esac    
+done         
+
+command -v iostat >/dev/null 2>&1 || { echo "iostat either not installed or not in PATH, may need to install sysstat package - exiting";exit 1;}
+command -v vmstat >/dev/null 2>&1 || { echo "vmstat either not installed or not in PATH, may need to install sysstat package - exiting";exit 1;}
+command -v ifconfig >/dev/null 2>&1 || { echo "ifconfig either not installed or not in PATH, may need to install sysstat package - exiting";exit 1;}
+forests=0
+open_forests=0
+
+
+if [ $collect_mlstats -eq 1 ]
+then
+
+   if [ "$database" == "" ]
+   then
+   echo "Database must be specified - exiting" 
+   exit
+   fi
+
+   if [ ! -f /opt/MarkLogic/Admin/stats.xqy ];
+   then
+   echo "stats.xqy file not in /opt/MarkLogic/Admin - exiting"
+   exit
+   fi
+
+   if [ "$low_level_stats" != "" ] && [ -f $low_level_stats ]
+   then
+     rm $low_level_stats
+   fi
+
+fi
+
+if [ "$http" != "" ] || [ "$xdbc" != "" ]
+then
+
+if [ ! -f /opt/MarkLogic/Admin/http-server-status.xqy ];
+then
+echo "http-server-status.xqy file not in /opt/MarkLogic/Admin - exiting"
+exit
+fi
+
+if [ ! -f /opt/MarkLogic/Admin/get-hosts.xqy ];
+then
+echo "get-hosts.xqy file not in /opt/MarkLogic/Admin - exiting"
+exit
+fi
+
+fi
+
+# Get the list of servers in the cluster
+
+curl --digest -u $user:$passwd http://$running_host:8001/get-hosts.xqy > /tmp/host_list 2>/dev/null
+authorized=`grep Unauthorized /tmp/host_list  | wc -l`
+
+if [ $authorized -ne 0 ]
+then
+echo "User or passwd incorrect exiting"
+exit
+fi
+
+list_of_servers=`cat /tmp/host_list`
+
+# By default mlstat displays major events from the system log as they occur
+# We can redirect the output to a seperate file
+if [ "$log_updates" != "" ]  && [ "$log_updates" != "stdout" ]
+ then
+  if [ -f $log_updates ]
+   then
+    rm $log_updates
+ fi
+fi
+
+if [ $saves -ne 0 ] || [ $merges -ne 0 ] || [ "$log_updates" != "" ]
+then
+  prev_log_length=`cat $log_location | wc -l`
+fi
+
+
+if [ $collect_mlstats -eq 1 ]
+then
+
+prev_docs=0
+prev_del=0
+prev_reindex=0
+prev_query_bytes=0
+prev_merge_reads=0
+prev_merge_writes=0
+prev_journal_writes=0
+prev_save_writes=0
+prev_query_time=0
+prev_save_time=0
+prev_journal_time=0
+prev_merge_read_time=0
+prev_merge_write_time=0
+
+prev_backup_reads=0
+prev_backup_writes=0
+prev_backup_read_time=0
+prev_backup_write_time=0
+prev_restore_writes=0
+prev_restore_reads=0
+prev_restore_read_time=0
+prev_restore_write_time=0
+
+prev_replication_receives=0
+prev_replication_sends=0
+prev_replication_receive_time=0
+prev_replication_send_time=0
+
+
+
+# Lets get the first sample
+if [ "$hostname" != "" ]
+then
+#   curl --digest -u $user:$passwd http://$running_host:8001/stats.xqy?dbname=$database\&hostname=$hostname > /tmp/cfsg.$my_version 2>/dev/null
+   curl --digest http://$user:$passwd@$running_host:8001/stats.xqy?dbname=$database\&hostname=$hostname\&replica=$replica_stats > /tmp/cfsg.$my_version 2>/dev/null
+else
+#   curl --digest -u $user:$passwd http://$running_host:8001/stats.xqy?dbname=$database > /tmp/cfsg.$my_version 2>/dev/null
+   curl --digest http://$user:$passwd@$running_host:8001/stats.xqy?dbname=$database\&replica=$replica_stats > /tmp/cfsg.$my_version 2>/dev/null
+fi
+
+if [ "$low_level_stats" != "" ]
+then
+  epoch=`date +%s`
+  printf "%d\t" $epoch > $low_level_stats
+  cat /tmp/cfsg.$my_version >> $low_level_stats
+fi
+
+forests=`cat /tmp/cfsg.$my_version | awk '{print $3}'`
+open_forests=`cat /tmp/cfsg.$my_version | awk '{print $36}'`
+
+# We can only use the data if it is valid, all the forests must be open
+if [ $forests -eq $open_forests ] || [ "$replica_stats" == "yes" ]
+then
+
+prev_docs=`cat /tmp/cfsg.$my_version | awk '{print $2}'`
+prev_del=`cat /tmp/cfsg.$my_version | awk '{i=NF-1;print $i}'`
+prev_reindex=`cat /tmp/cfsg.$my_version | awk '{i=NF;print $i}'`
+prev_merge_reads=`cat /tmp/cfsg.$my_version | awk '{print $6}'`
+prev_merge_writes=`cat /tmp/cfsg.$my_version | awk '{print $7}'`
+prev_journal_writes=`cat /tmp/cfsg.$my_version | awk '{print $8}'`
+prev_save_writes=`cat /tmp/cfsg.$my_version | awk '{print $11}'`
+prev_query_bytes=`cat /tmp/cfsg.$my_version | awk '{print $12}'`
+prev_query_time=`cat /tmp/cfsg.$my_version | awk '{print $27}'`
+prev_save_time=`cat /tmp/cfsg.$my_version | awk '{print $24}'`
+prev_journal_time=`cat /tmp/cfsg.$my_version | awk '{print $23}'`
+prev_merge_read_time=`cat /tmp/cfsg.$my_version | awk '{print $26}'`
+prev_merge_write_time=`cat /tmp/cfsg.$my_version | awk '{print $25}'`
+
+prev_backup_reads=`cat /tmp/cfsg.$my_version | awk '{print $37}'`
+prev_backup_writes=`cat /tmp/cfsg.$my_version | awk '{print $38}'`
+prev_backup_write_time=`cat /tmp/cfsg.$my_version | awk '{print $41}'`
+prev_backup_read_time=`cat /tmp/cfsg.$my_version | awk '{print $42}'`
+
+prev_restore_reads=`cat /tmp/cfsg.$my_version | awk '{print $45}'`
+prev_restore_writes=`cat /tmp/cfsg.$my_version | awk '{print $46}'`
+prev_restore_read_time=`cat /tmp/cfsg.$my_version | awk '{print $50}'`
+prev_restore_write_time=`cat /tmp/cfsg.$my_version | awk '{print $49}'`
+
+prev_replication_receives=`cat /tmp/cfsg.$my_version | awk '{print $61}'`
+prev_replication_sends=`cat /tmp/cfsg.$my_version | awk '{print $65}'`
+prev_replication_receive_time=`cat /tmp/cfsg.$my_version | awk '{print $63}'`
+prev_replication_send_time=`cat /tmp/cfsg.$my_version | awk '{print $67}'`
+fi
+
+fi
+
+
+header
+
+header_count=0
+
+
+
+if [ "$disk_name" != "" ]
+then
+iostat -tmx $requested_interval | awk -v disk_name="$disk_name" -v my_version="$my_version"  -v accumulate_disks="$accumulate_disks" ' \
+        BEGIN{found_disk=0;rds=0;wrts=0;mrds=0;mwrs=0;svc_avg=0;utl_avg=0}
+       /avg-cpu/ {cpu_line=(NR+1)}
+        /avg-cpu/{ if (found_disk != 0) {
+                       if (accumulate_disks==1){
+                                 printf"\t%s\t%s\t%s\t%s\t%s\t%s", user, nice, sys, idle, iowait, steal > "/tmp/ios-temp."my_version ;
+                                 printf "\t%d\t%d\t%3.2f\t%3.2f\t%3.2f\t%3.2f",rds,wrts,mrds,mwrs,svc_avg/found_disk,utl_avg/found_disk > "/tmp/ios-temp."my_version;
+                                 found_disk=0;rds=0;wrts=0;mrds=0;mwrs=0;svc_avg=0;utl_avg=0 }
+                        printf "\n" >> "/tmp/ios-temp."my_version} }
+        /avg-cpu/ {system("")} 
+        {if (NR==cpu_line) {user= $1;nice= $2;sys= $3;idle= $6;iowait= $4;steal= $5
+                             if (accumulate_disks == 0) { printf"\t%s\t%s\t%s\t%s\t%s\t%s", user, nice, sys, idle, iowait, steal > "/tmp/ios-temp."my_version  }} }
+
+        $0 ~ disk_name  { if (accumulate_disks == 0) {
+                             found_disk++;
+                             if (NF==14){printf "\t%s\t%s\t%s\t%s\t%s\t%s", $4, $5, $6, $7, $13, $14 >> "/tmp/ios-temp."my_version}
+                             else {printf "\t%s\t%s\t%s\t%s\t%s\t%s", $4, $5, $6, $7, $11, $12 >>  "/tmp/ios-temp."my_version}
+                           }
+                          else {
+                             found_disk++;
+                             if (NF==14){rds+=$4; wrts+=$5; mrds+=$6; mwrs+=$7;svc_avg+= $13;utl_avg+=$14}
+                             else{rds+=$4; wrts+=$5; mrds+=$6; mwrs+=$7;svc_avg+= $11;utl_avg+=$12}  } } '  &
+
+else 
+iostat -tmx $requested_interval | awk -v my_version="$my_version"  ' \
+       /avg-cpu/ {cpu_line=(NR+1)}
+       {if (NR==cpu_line) {printf"\t%s\t%s\t%s\t%s\t%s\t%s\n", $1, $2, $3, $6, $4, $5 > "/tmp/ios-temp."my_version;system("") }} ' &
+fi
+
+# get our first iostat/vmstat and log
+if [ $real_net -eq 1 ]
+then
+prev_rx_bytes=`/sbin/ifconfig $net_name 2>/dev/null  | grep "RX bytes" | cut -d: -f2 | awk '{ printf $1 }'`
+prev_tx_bytes=`/sbin/ifconfig $net_name 2>/dev/null  | grep "TX bytes" | awk ' {print $6}' | cut -d: -f2 | awk '{ printf $1 }'`
+fi
+
+
+epoch=`date +%s`
+
+# iostat also acts as the initial delay
+vmstat $requested_interval 2 > /tmp/vms-temp.$my_version 
+
+
+this_sample=0
+while [  $this_sample -lt $sample_count ]
+do
+
+if [ $do_header -eq 1 ]
+then 
+  if [ $header_count -eq 10 ]
+  then
+    header
+    header_count=0
+  else
+   header_count=$(expr $header_count + 1)
+  fi
+fi
+
+if [ $saves -ne 0 ] || [ $merges -ne 0 ] || [ "$log_updates" != "" ]
+then
+
+# What's new in the system log
+current_log_length=`cat $log_location | wc -l`
+cat $log_location  | awk -v current_log_length="$current_log_length" -v prev_log_length="$prev_log_length" ' \
+    {if ((NR > prev_log_length) && (NR <= current_log_length)){print $0}}'   > /tmp/new_log.$my_version
+
+
+number_saves=`cat /tmp/new_log.$my_version | awk ' /Saved/ { saved++ }END{print saved} '`
+number_merges=`cat /tmp/new_log.$my_version | awk ' /Merged/ { merged++ }END{print merged} '`
+
+prev_log_length=$current_log_length
+
+if [ "$log_updates" != "" ]
+then
+
+
+if [ "$log_updates" == "stdout" ]
+then
+cat /tmp/new_log.$my_version | awk ' \
+   /Saved/ { print $0 } \
+   /Merged/ { print $0 } '
+
+
+else
+
+cat /tmp/new_log.$my_version | awk ' \
+   /Saved/ { print $0 } \
+   /Merged/ { print $0 } '    >> $log_updates
+
+fi
+fi
+
+
+fi
+
+previous_epoch=$epoch
+epoch=`date +%s`
+interval=$(expr $epoch - $previous_epoch )
+
+if [ $collect_mlstats -eq 1 ]
+then
+
+if [ "$hostname" != "" ]
+then
+   curl --digest -u $user:$passwd http://$user:$passwd@$running_host:8001/stats.xqy?dbname=$database\&hostname=$hostname\&replica=$replica_stats > /tmp/cfsg.$my_version 2>/dev/null
+#   curl --digest -u $user:$passwd http://$running_host:8001/stats.xqy?dbname=$database\&hostname=$hostname > /tmp/cfsg.$my_version 2>/dev/null
+else
+   curl --digest -u $user:$passwd http://$user:$passwd@$running_host:8001/stats.xqy?dbname=$database\&replica=$replica_stats > /tmp/cfsg.$my_version 2>/dev/null
+#   curl --digest -u $user:$passwd http://$running_host:8001/stats.xqy?dbname=$database > /tmp/cfsg.$my_version 2>/dev/null
+fi
+
+
+if [ "$low_level_stats" != "" ]
+then
+  printf "%d " $epoch >> $low_level_stats
+  cat /tmp/cfsg.$my_version >> $low_level_stats
+fi
+
+forests=`cat /tmp/cfsg.$my_version | awk '{print $3}'`
+open_forests=`cat /tmp/cfsg.$my_version | awk '{print $36}'`
+
+fi
+
+
+# We can only use the data if it is valid, all the forests must be open
+if [ $forests -eq $open_forests ] || [ "$replica_stats" == "yes" ]
+then
+
+if [ $date_timestamp_include -eq 1 ]
+then
+   tstmp=`date +'%Y-%m-%d %H:%M:%S'`
+   if [ $orca -eq 1 ]
+   then
+   echo $tstmp | awk '{printf "%s,",$0}'
+   else
+   echo $tstmp | awk '{printf "%s\t",$0}'
+   fi
+fi
+
+
+if [ $timestamp_include -eq 1 ]
+then
+   tstmp=`date +%H:%M:%S`
+   if [ $orca -eq 1 ]
+   then
+   echo $tstmp | awk '{printf "%s,",$0}'
+   else
+   echo $tstmp | awk '{printf "%s\t",$0}'
+   fi
+fi
+
+
+if [ $epoch_include -eq 1 ]
+then
+   if [ $orca -eq 1 ]
+   then
+  printf "%d," $epoch
+   else
+  printf "%d\t" $epoch
+   fi
+fi
+
+if [ "$comment" != "" ] && [ $orca -eq 1 ]
+then
+   printf "%s," $comment
+fi
+
+
+
+if [ $collect_mlstats -eq 1 ]
+then
+
+#if we clear the database docs will go to 0, dont want a negative number
+
+if [ $doc_stats -eq 1 ]
+then
+   if [ $orca -eq 1 ]
+   then
+     cat /tmp/cfsg.$my_version  | awk -v prev_docs="$prev_docs" -v prev_del="$prev_del" -v prev_reindex="$prev_reindex" -v interval="$interval" -v prev_query_bytes="$prev_query_bytes" ' \
+          {if($2==0){printf "0,"}else{printf "%d,",($2-prev_docs)/interval}} 
+          {i=NF-1;if($i==0){printf "0,"}else{printf "%d,",($i-prev_del)/interval}} 
+          {i=NF;if($i==0){printf "0,"}else{printf "%d,",($i-prev_reindex)/interval};printf "%d,",$4} '
+   else
+     cat /tmp/cfsg.$my_version  | awk -v prev_docs="$prev_docs" -v interval="$interval" -v prev_query_bytes="$prev_query_bytes" ' \
+          {if($2==0){printf "\t0"}else{printf " %d",($2-prev_docs)/interval}} 
+          {i=NF-1;if($i==0){printf "\t0"}else{printf "\t%d",($i-prev_del)/interval}} 
+          {i=NF;if($i==0){printf "\t0"}else{printf "\t%d",($i-prev_reindex)/interval};printf "\t%d\t",$4} '
+   fi
+fi
+
+if [ $query_stats -eq 1 ]
+then
+   if [ $orca -eq 1 ]
+   then
+     cat /tmp/cfsg.$my_version  | awk -v prev_docs="$prev_docs" -v interval="$interval" -v prev_query_bytes="$prev_query_bytes" ' \
+          {if($12==0){printf "0,"}else{printf "%d,",(($12-prev_query_bytes)/(1024*1024))/interval}}' 
+   else
+     cat /tmp/cfsg.$my_version  | awk -v prev_docs="$prev_docs" -v interval="$interval" -v prev_query_bytes="$prev_query_bytes" ' \
+          {if($12==0){printf "0\t"}else{printf "%d\t",(($12-prev_query_bytes)/(1024*1024))/interval}}' 
+   fi
+fi
+
+if [ $forest_stats -eq 1 ]
+then
+   if [ $orca -eq 1 ]
+   then
+      cat /tmp/cfsg.$my_version  | awk ' { printf ("%s,%s,",$17,$21) } '
+   else
+      cat /tmp/cfsg.$my_version  | awk ' {printf ("%s\t%s\t",$17,$21) } '
+   fi
+fi
+
+fi
+
+
+
+
+if [ $sys_stats -eq 1 ] 
+then
+   if [ $orca -eq 1 ]
+   then
+     tail -1 /tmp/ios-temp.$my_version | awk '{printf("%s,%s,%s,%s,%s,%s,", $1, $2, $3, $4, $5, $6 )}'
+     cat /tmp/vms-temp.$my_version | awk ' {if (NR ==4){printf ",%d,%d,%d,%d,%d",$1,$2,$7,$8,$12}}' 
+   else
+     tail -1 /tmp/ios-temp.$my_version | awk '{printf("%s\t%s\t%s\t%s\t%s\t%s\t", $1, $2, $3, $4, $5, $6 )}'
+     cat /tmp/vms-temp.$my_version | awk ' {if (NR ==4){printf "%d\t%d\t%d\t%d\t%d\t",$1,$2,$7,$8,$12}}' 
+   fi
+fi
+
+if [ "$disk_name" != "" ]
+then
+  if [ $accumulate_disks -eq 0 ]
+  then
+
+
+   if [ $orca -eq 1 ]
+   then
+     tail -1 /tmp/ios-temp.$my_version | awk '{for (i=7;i<=NF;i++){printf("%s,", $i)}}'
+   else
+     tail -1 /tmp/ios-temp.$my_version | awk '{for (i=7;i<=NF;i++){printf("%s\t", $i)}}'
+   fi
+  else
+# Get the disk statistics, we show the disk otherwise dashes
+   if [ $orca -eq 1 ]
+   then
+     tail -1 /tmp/ios-temp.$my_version | awk '{printf("%s,%s,%s,%s,%s,%s,", $7, $8, $9, $10, $11, $12)}'
+   else
+     tail -1 /tmp/ios-temp.$my_version | awk '{printf("%s\t%s\t%s\t%s\t%s\t%s\t", $7, $8, $9, $10, $11, $12)}'
+
+   fi
+  fi
+
+fi
+
+if [ "$net_name" != "" ]
+then
+# Get the network statistics
+if [ $real_net -eq 1 ]
+then
+   if [ $orca -eq 1 ]
+   then
+     /sbin/ifconfig $net_name 2>/dev/null  | grep "RX bytes" | cut -d: -f2 | awk -v prev_rx_bytes="$prev_rx_bytes" -v interval="$interval" ' \
+        { printf ("%d,",  ((($1-prev_rx_bytes)/interval)*8) / 1024) }'
+     /sbin/ifconfig $net_name 2>/dev/null  | grep "TX bytes" | awk ' {print $6}' | cut -d: -f2 | awk -v prev_tx_bytes="$prev_tx_bytes" -v interval="$interval" ' \
+        { printf ("%d,",  ((($1-prev_tx_bytes)/interval)*8) / 1024 ) }'
+    else
+     /sbin/ifconfig $net_name 2>/dev/null  | grep "RX bytes" | cut -d: -f2 | awk -v prev_rx_bytes="$prev_rx_bytes" -v interval="$interval" ' \
+        { printf ("%d\t",  ((($1-prev_rx_bytes)/interval)*8) / 1024) }'
+     /sbin/ifconfig $net_name 2>/dev/null  | grep "TX bytes" | awk ' {print $6}' | cut -d: -f2 | awk -v prev_tx_bytes="$prev_tx_bytes" -v interval="$interval" ' \
+        { printf ("%d\t",  ((($1-prev_tx_bytes)/interval)*8) / 1024 ) }'
+    fi
+else 
+   if [ $orca -eq 1 ]
+   then
+     printf "0,0,"
+   else
+     printf "0\t0\t"
+   fi
+fi
+
+if [ $real_net -eq 1 ]
+then
+  prev_rx_bytes=`/sbin/ifconfig $net_name 2>/dev/null  | grep "RX bytes" | cut -d: -f2 | awk  '{ printf $1 }'`
+  prev_tx_bytes=`/sbin/ifconfig $net_name 2>/dev/null  | grep "TX bytes" | awk ' {print $6}' | cut -d: -f2 | awk  '{ printf $1 }'`
+fi
+fi
+
+
+
+
+if [ $collect_mlstats -eq 1 ]
+then
+
+if [ $journal -eq 1 ]
+then
+   if [ $orca -eq 1 ]
+   then
+     cat /tmp/cfsg.$my_version  | awk -v prev_journal_writes="$prev_journal_writes"  -v interval="$interval" ' \
+          {if($8==0){printf "0,"}else {printf ("%d,",(($8-prev_journal_writes)/(1024*1024))/interval)}} '
+   else
+
+     cat /tmp/cfsg.$my_version  | awk -v prev_journal_writes="$prev_journal_writes"  -v interval="$interval" ' \
+          {printf ("%d\t",(($8-prev_journal_writes)/(1024*1024))/interval)} '
+   fi
+
+fi
+
+
+# Calculate saves
+if [ $saves -eq 1 ]
+then
+   if [ $orca -eq 1 ]
+   then
+     cat /tmp/cfsg.$my_version  | awk -v prev_save_writes="$prev_save_writes"  -v interval="$interval" -v number_saves="$number_saves" ' \
+          {if ($11 == 0){printf "0,"}else {printf ("%d,%d,",number_saves,(($11-prev_save_writes)/(1024*1024))/interval)}} '
+   else
+     cat /tmp/cfsg.$my_version  | awk -v prev_save_writes="$prev_save_writes"  -v interval="$interval" -v number_saves="$number_saves" ' \
+          {printf ("%d\t%d\t",number_saves,(($11-prev_save_writes)/(1024*1024))/interval)} '
+   fi
+fi
+
+if [ $merges -eq 1 ]
+then
+   if [ $orca -eq 1 ]
+   then
+     cat /tmp/cfsg.$my_version  | awk -v prev_merge_reads="$prev_merge_reads" -v prev_merge_writes="$prev_merge_writes"  -v interval="$interval" -v number_merges="$number_merges" ' \
+          {printf ("%d,%d,",$5,number_merges)
+          {if ($6 == 0){printf "0,"}else{printf ("%d,",(($6-prev_merge_reads)/(1024*1024))/interval)}}
+          {if ($7 == 0){printf "0,"}else{printf ("%d,",(($7-prev_merge_writes)/(1024*1024))/interval)}}}'
+   else
+     cat /tmp/cfsg.$my_version  | awk -v prev_merge_reads="$prev_merge_reads" -v prev_merge_writes="$prev_merge_writes"  -v interval="$interval" -v number_merges="$number_merges" ' \
+          {printf ("%d\t%d\t%d\t%d\t",$5,number_merges,(($6-prev_merge_reads)/(1024*1024))/interval,(($7-prev_merge_writes)/(1024*1024))/interval)} '
+   fi
+fi
+
+if [ $sizes -eq 1 ]
+then
+   if [ $orca -eq 1 ]
+   then
+     cat /tmp/cfsg.$my_version  | awk ' {printf ("%d,%d,",$13,$14)} '
+   else
+     cat /tmp/cfsg.$my_version  | awk ' {printf ("%d\t%d\t",$13,$14)} '
+   fi
+fi
+
+if [ "$http" != "" ]
+then
+   if [ "$hostname" != "" ]
+   then
+      curl --digest -u $user:$passwd http://$running_host:8001/http-server-status.xqy?http-servername=$http\&hostname=$hostname > /tmp/http.$my_version 2>/dev/null
+   else
+   # Need to collect data for the whole list
+   rm /tmp/accumul.$my_version 2>/dev/null
+   for hname in $list_of_servers
+   do
+
+   curl --digest -u $user:$passwd http://$running_host:8001/http-server-status.xqy?http-servername=$http\&hostname=$hname >> /tmp/accumul.$my_version  2>/dev/null
+
+   done
+   # accumulate
+   cat /tmp/accumul.$my_version | awk ' {server_cnt++; 
+                             server_name = $1; 
+                             req_count += $2; 
+                             up_count += $3; 
+                             backlog += $4; 
+                             threads += $5; 
+                             request_rate += $6; 
+                             etc_hit_rate += $7; 
+                             etc_miss_rate += $8;
+                             expanded_tree_cache_hits += $9; 
+                             expanded_tree_cache_misses += $10; 
+                             fpc_hit_rate += $11; 
+                             fpc_miss_rate += $12;
+                             fs_program_cache_hits += $13; 
+                             fs_program_cache_misses += $14; 
+                             dpc_hit_rate += $15; 
+                             dpc_miss_rate += $16;
+                             db_program_cache_hits += $17; 
+                             db_program_cache_misses += $18; 
+                             epc_hit_rate += $19; 
+                             epc_miss_rate += $20;
+                             env_program_cache_hits += $21; 
+                             env_program_cache_misses +=$22; 
+                             fmm_hit_rate += $23; 
+                             fmm_miss_rate += $24;
+                             fs_main_module_seq_cache_hits += $25; 
+                             fs_main_module_seq_cache_misses += $26; 
+                             dmm_hit_rate += $27; 
+                             dmm_miss_rate += $28;
+                             db_main_module_seq_cache_hits  += $29; 
+                             db_main_module_seq_cache_misses += $30; 
+                             flm_hit_rate += $31; 
+                             flm_miss_rate += $32;
+                             fs_lib_module_cache_hits += $33; 
+                             fs_lib_module_cache_misses += $34; 
+                             dlm_hit_rate += $35; 
+                             dlm_miss_rate += $36; 
+                             db_lib_module_cache_hits += $37; 
+                             db_lib_module_cache_misses += $38} 
+                   END{printf "%s %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d\n", server_name,
+                             req_count,
+                             up_count,
+                             backlog,
+                             threads,
+                             request_rate,
+                             etc_hit_rate/server_cnt,
+                             etc_miss_rate/server_cnt,
+                             expanded_tree_cache_hits,
+                             expanded_tree_cache_misses,
+                             fpc_hit_rate/server_cnt,
+                             fpc_miss_rate/server_cnt,
+                             fs_program_cache_hits,
+                             fs_program_cache_misses,
+                             dpc_hit_rate/server_cnt,
+                             dpc_miss_rate/server_cnt,
+                             db_program_cache_hits,
+                             db_program_cache_misses,
+                             epc_hit_rate/server_cnt,
+                             epc_miss_rate/server_cnt,
+                             env_program_cache_hits,
+                             env_program_cache_misses,
+                             fmm_hit_rate/server_cnt,
+                             fmm_miss_rate/server_cnt,
+                             fs_main_module_seq_cache_hits,
+                             fs_main_module_seq_cache_misses,
+                             dmm_hit_rate/server_cnt,
+                             dmm_miss_rate/server_cnt,
+                             db_main_module_seq_cache_hits,
+                             db_main_module_seq_cache_misses,
+                             flm_hit_rate/server_cnt,
+                             flm_miss_rate/server_cnt,
+                             fs_lib_module_cache_hits,
+                             fs_lib_module_cache_misses,
+                             dlm_hit_rate/server_cnt,
+                             dlm_miss_rate/server_cnt,
+                             db_lib_module_cache_hits,
+                             db_lib_module_cache_misses}' > /tmp/http.$my_version
+
+   fi
+
+   if [ $orca -eq 1 ]
+   then
+      cat /tmp/http.$my_version | awk ' {printf "%6.2f,%s,%s,%s,%s,",$6,$2,$3,$5,$7} '
+      if [ $verbose_stats -eq 1 ]
+      then
+         cat /tmp/http.$my_version | awk ' {printf "%s,%s,%s,%s,%s,%s,%s,",$11,$15,$19,$23,$27,$31,$35} '
+      fi
+    else
+      cat /tmp/http.$my_version | awk ' {printf "%6.2f\t%s\t%s\t%s\t%s\t",$6,$2,$3,$5,$7} '
+      if [ $verbose_stats -eq 1 ]
+      then
+         cat /tmp/http.$my_version | awk ' {printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t",$11,$15,$19,$23,$27,$31,$35} '
+      fi
+    fi
+fi
+
+if [ "$xdbc" != "" ]
+then
+   if [ "$hostname" != "" ]
+   then
+      curl --digest -u $user:$passwd http://$running_host:8001/http-server-status.xqy?xdbc-servername=$xdbc\&hostname=$hostname > /tmp/xdbc.$my_version 2>/dev/null
+   else
+   # Need to collect data for the whole list
+   rm /tmp/accumul.$my_version 2>/dev/null
+   for hname in $list_of_servers
+   do
+
+   curl --digest -u $user:$passwd http://$running_host:8001/http-server-status.xqy?xdbc-servername=$xdbc\&hostname=$hname >> /tmp/accumul.$my_version  2>/dev/null
+
+   done
+   # accumulate
+   cat /tmp/accumul.$my_version | awk ' {server_cnt++; 
+                             server_name = $1; 
+                             req_count += $2; 
+                             up_count += $3; 
+                             backlog += $4; 
+                             threads += $5; 
+                             request_rate += $6; 
+                             etc_hit_rate += $7; 
+                             etc_miss_rate += $8;
+                             expanded_tree_cache_hits += $9; 
+                             expanded_tree_cache_misses += $10; 
+                             fpc_hit_rate += $11; 
+                             fpc_miss_rate += $12;
+                             fs_program_cache_hits += $13; 
+                             fs_program_cache_misses += $14; 
+                             dpc_hit_rate += $15; 
+                             dpc_miss_rate += $16;
+                             db_program_cache_hits += $17; 
+                             db_program_cache_misses += $18; 
+                             fmm_hit_rate += $19; 
+                             fmm_miss_rate += $20;
+                             fs_main_module_seq_cache_hits += $21; 
+                             fs_main_module_seq_cache_misses += $22; 
+                             dmm_hit_rate += $23; 
+                             dmm_miss_rate += $24;
+                             db_main_module_seq_cache_hits  += $25; 
+                             db_main_module_seq_cache_misses += $26; 
+                             flm_hit_rate += $27; 
+                             flm_miss_rate += $28;
+                             fs_lib_module_cache_hits += $29; 
+                             fs_lib_module_cache_misses += $30; 
+                             dlm_hit_rate += $31; 
+                             dlm_miss_rate += $32; 
+                             db_lib_module_cache_hits += $33; 
+                             db_lib_module_cache_misses += $34} 
+                   END{printf "%s %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d \n",
+                             server_name,
+                             req_count,
+                             up_count,
+                             backlog,
+                             threads,
+                             request_rate,
+                             etc_hit_rate/server_cnt,
+                             etc_miss_rate/server_cnt,
+                             expanded_tree_cache_hits,
+                             expanded_tree_cache_misses,
+                             fpc_hit_rate/server_cnt,
+                             fpc_miss_rate/server_cnt,
+                             fs_program_cache_hits,
+                             fs_program_cache_misses,
+                             dpc_hit_rate/server_cnt,
+                             dpc_miss_rate/server_cnt,
+                             db_program_cache_hits,
+                             db_program_cache_misses,
+                             fmm_hit_rate/server_cnt,
+                             fmm_miss_rate/server_cnt,
+                             fs_main_module_seq_cache_hits,
+                             fs_main_module_seq_cache_misses,
+                             dmm_hit_rate/server_cnt,
+                             dmm_miss_rate/server_cnt,
+                             db_main_module_seq_cache_hits,
+                             db_main_module_seq_cache_misses,
+                             flm_hit_rate/server_cnt,
+                             flm_miss_rate/server_cnt,
+                             fs_lib_module_cache_hits,
+                             fs_lib_module_cache_misses,
+                             dlm_hit_rate/server_cnt,
+                             dlm_miss_rate/server_cnt,
+                             db_lib_module_cache_hits,
+                             db_lib_module_cache_misses}' > /tmp/xdbc.$my_version
+
+
+   fi
+   if [ $orca -eq 1 ]
+   then
+      cat /tmp/xdbc.$my_version | awk ' {printf "%6.2f,%s,%s,%s,%s,",$6,$2,$3,$5,$7} '
+      if [ $verbose_stats -eq 1 ]
+      then
+         cat /tmp/xdbc.$my_version | awk ' {printf "%s,%s,%s,%s,%s,%s,",$11,$15,$19,$23,$27,$31} '
+      fi
+   else
+      cat /tmp/xdbc.$my_version | awk ' {printf "%6.2f\t%s\t%s\t%s\t%s\t",$6,$2,$3,$5,$7} '
+      if [ $verbose_stats -eq 1 ]
+      then
+         cat /tmp/xdbc.$my_version | awk ' {printf "%s\t%s\t%s\t%s\t%s\t%s\t",$11,$15,$19,$23,$27,$31} '
+      fi
+   fi
+fi
+
+
+fi
+if [ $do_proc_memory -eq 1 ]
+then
+ML_proc=`ps -ef | grep MarkLogic | grep daemon | awk '{print $2}'`
+
+   if [ $orca -eq 1 ]
+   then
+     pmap -x $ML_proc  | awk '/total/{tot_size=$3;tot_rss=$4}
+                                     {if (match($5,"s") != 0){mmap_size+=$2;mmap_rss+=$3};
+                                      if(match($7,"anon") != 0){anon_size+=$2;anon_rss+=$3}}
+                                      END{printf "%d,%d,%d,%d,%d,%d,",anon_size/(1024),anon_rss/(1024),mmap_size/(1024),mmap_rss/(1024),tot_size/(1024),tot_rss/(1024)}'
+   else
+     pmap -x $ML_proc  | awk '/total/{tot_size=$3;tot_rss=$4}
+                                     {if (match($5,"s") != 0){mmap_size+=$2;mmap_rss+=$3};
+                                      if(match($7,"anon") != 0){anon_size+=$2;anon_rss+=$3}}
+                                      END{printf "%d\t%d\t%d\t%d\t%d\t%d\t",anon_size/(1024),anon_rss/(1024),mmap_size/(1024),mmap_rss/(1024),tot_size/(1024),tot_rss/(1024)}'
+   fi
+
+fi
+
+if [ $do_proc_status -eq 1 ]
+then
+ML_proc=`ps -ef | grep MarkLogic | grep daemon | awk '{print $2}'`
+
+   if [ $orca -eq 1 ]
+   then
+     cat /proc/$ML_proc/status  | awk '/VmPeak/{peak=($2 / 1024)}
+                                      /VmSize/{vmsize=($2 / 1024)}
+                                      /VmHWM/{hwm=($2 / 1024)}
+                                      /VmRSS/{rss=($2 / 1024)}
+                                      /VmData/{data=($2 / 1024)}
+                                      END{printf "%d,%d,%d,%d,%d,",peak,vmsize,hwm,rss,data}'
+   else
+     cat /proc/$ML_proc/status  | awk 'BEGIN{peak=0;vmsize=0;hwm=0;rss=0;data=0}
+                                       /VmPeak/{peak=($2/1024)}
+                                      /VmSize/{vmsize=($2/1024)}
+                                      /VmHWM/{hwm=($2/1024)}
+                                      /VmRSS/{rss=($2/1024)}
+                                      /VmData/{data=($2/1024)}
+                                      END{printf "%d\t%d\t%d\t%d\t%d\t",peak,vmsize,hwm,rss,data}'
+   fi
+
+fi
+if [ $replication_stats -eq 1 ]
+then
+   if [ $orca -eq 1 ]
+   then
+     cat /tmp/cfsg.$my_version  | awk -v prev_replication_receives="$prev_replication_receives"  -v prev_replication_sends="$prev_replication_sends" -v prev_replication_receive_time="$prev_replication_receive_time" -v prev_replication_send_time="$prev_replication_send_time" -v interval="$interval" ' \
+          { replication_recv_iops= int(($61 - prev_replication_receives)/(1024));
+           replication_send_iops=int(($65 - prev_replication_sends)/(1024));
+	   printf "%d,%d,",replication_recv_iops/interval,replication_send_iops/interval;
+           if (($63 ==0) || (replication_recv_iops == 0)){printf "0,"} else{ printf "%3.2f,",($63 - prev_replication_receive_time)/replication_recv_iops}
+           if (($67 ==0) || (replication_send_iops == 0)){printf "0,"} else{ printf "%3.2f,",($67 - prev_replication_send_time)/replication_send_iops}
+           printf "%6.2f,%6.2f,",$64,$68}'
+
+   else
+     cat /tmp/cfsg.$my_version  | awk -v prev_replication_receives="$prev_replication_receives"  -v prev_replication_sends="$prev_replication_sends" -v prev_replication_receive_time="$prev_replication_receive_time" -v prev_replication_send_time="$prev_replication_send_time" -v interval="$interval" ' \
+          { replication_recv_iops= int(($61 - prev_replication_receives)/(1024));
+           replication_send_iops=int(($65 - prev_replication_sends)/(1024));
+	   printf "%d\t%d\t",replication_recv_iops/interval,replication_send_iops/interval;
+           if (($63 ==0) || (replication_recv_iops == 0)){printf "0\t"} else{ printf "%3.2f\t",($63 - prev_replication_receive_time)/replication_recv_iops}
+           if (($67 ==0) || (replication_send_iops == 0)){printf "0\t"} else{ printf "%3.2f\t",($67 - prev_replication_send_time)/replication_send_iops}
+           printf "%6.2f\t%6.2f\t",$64,$68}'
+
+   fi
+fi
+if [ $backup_stats -eq 1 ]
+then
+   if [ $orca -eq 1 ]
+   then
+     cat /tmp/cfsg.$my_version  | awk -v prev_backup_reads="$prev_backup_reads"  -v prev_backup_writes="$prev_backup_writes" -v prev_restore_writes="$prev_restore_writes" -v prev_restore_reads="$prev_restore_reads" -v prev_backup_read_time="$prev_backup_read_time"   -v prev_backup_write_time="$prev_backup_write_time"   -v prev_restore_read_time="$prev_restore_read_time"   -v prev_restore_write_time="$prev_restore_write_time"   -v interval="$interval" ' \
+          { backup_read_iops= int(($37 - prev_backup_reads)/(512*1024));
+           backup_write_iops=int(($38 - prev_backup_writes)/(512*1024));
+           restore_read_iops= int(($45 - prev_restore_reads)/(512*1024));
+           restore_write_iops=int(($46 - prev_restore_writes)/(512*1024));
+           printf "%d,%d,%d,%d,",backup_read_iops/interval,backup_write_iops/interval,restore_read_iops/interval,restore_write_iops/interval;
+           if (($42 ==0) || (backup_read_iops == 0)){printf "0,"} else{ printf "%3.2f,",($42 - prev_backup_read_time)/backup_read_iops}
+           if (($41 ==0) || (backup_write_iops == 0)){printf "0,"} else{ printf "%3.2f,",($41 - prev_backup_write_time)/backup_write_iops}
+           if (($50 ==0) || (restore_read_iops == 0)){printf "0,"} else{ printf "%3.2f,",($50 - prev_restore_read_time)/restore_read_iops}
+           if (($49 ==0) || (restore_write_iops == 0)){printf "0,"} else{ printf "%3.2f,",($49 - prev_restore_write_time)/restore_write_iops}
+           printf "%6.2f,%6.2f,%6.2f,%6.2f,",$43,$44,$51,$52}'
+
+   else
+     cat /tmp/cfsg.$my_version  | awk -v prev_backup_reads="$prev_backup_reads"  -v prev_backup_writes="$prev_backup_writes" -v prev_restore_writes="$prev_restore_writes" -v prev_restore_reads="$prev_restore_reads" -v prev_backup_read_time="$prev_backup_read_time"   -v prev_backup_write_time="$prev_backup_write_time"   -v prev_restore_read_time="$prev_restore_read_time"   -v prev_restore_write_time="$prev_restore_write_time"   -v interval="$interval" ' \
+          { backup_read_iops= int(($37 - prev_backup_reads)/(512*1024));
+           backup_write_iops=int(($38 - prev_backup_writes)/(512*1024));
+           restore_read_iops= int(($45 - prev_restore_reads)/(512*1024));
+           restore_write_iops=int(($46 - prev_restore_writes)/(512*1024));
+           printf "%d\t%d\t%d\t%d\t",backup_read_iops/interval,backup_write_iops/interval,restore_read_iops/interval,restore_write_iops/interval;
+           if (($42 ==0) || (backup_read_iops == 0)){printf "0\t"} else{ printf "%3.2f\t",($42 - prev_backup_read_time)/backup_read_iops}
+           if (($41 ==0) || (backup_write_iops == 0)){printf "0\t"} else{ printf "%3.2f\t",($41 - prev_backup_write_time)/backup_write_iops}
+           if (($50 ==0) || (restore_read_iops == 0)){printf "0\t"} else{ printf "%3.2f\t",($50 - prev_restore_read_time)/restore_read_iops}
+           if (($49 ==0) || (restore_write_iops == 0)){printf "0\t"} else{ printf "%3.2f\t",($49 - prev_restore_write_time)/restore_write_iops}
+           printf "%6.2f\t%6.2f\t%6.2f\t%6.2f\t",$43,$44,$51,$52}'
+
+   fi
+fi
+
+
+if [ $ml_extended_io -eq 1 ]
+then
+   if [ $orca -eq 1 ]
+   then
+     cat /tmp/cfsg.$my_version  | awk -v prev_save_writes="$prev_save_writes"  -v prev_merge_reads="$prev_merge_reads" -v prev_merge_writes="$prev_merge_writes" -v prev_journal_writes="$prev_journal_writes" -v prev_query_bytes="$prev_query_bytes"  -v prev_query_time="$prev_query_time"   -v prev_save_time="$prev_save_time"   -v prev_journal_time="$prev_journal_time"   -v prev_merge_read_time="$prev_merge_read_time"   -v prev_merge_write_time="$prev_merge_write_time" -v interval="$interval" ' \
+          {save_iops=int(($11 - prev_save_writes)/(512*1024));
+           journal_iops=int(($8 - prev_journal_writes)/(512*1024));
+           merge_read_iops= int(($6 - prev_merge_reads)/(512*1024));
+           merge_write_iops=int(($7 - prev_merge_writes)/(512*1024));
+           total_write_iops=journal_iops+merge_write_iops+save_iops;
+           printf "%d,%d,%d,%d,%d,%d,",(total_write_iops/2)/interval,save_iops/interval,journal_iops/interval,merge_read_iops/interval,merge_write_iops/interval,total_write_iops/interval;
+           if (($24 ==0) || (save_iops == 0)){printf "0,"} else{ printf "%3.2f,",($24 - prev_save_time)/save_iops}
+           if (($23 ==0) || (journal_iops == 0)){printf "0,"} else{ printf "%3.2f,",($23 - prev_journal_time)/journal_iops}
+           if (($26 == 0) || (merge_read_iops == 0)){printf "0,"} else{ printf "%3.2f,",($26 - prev_merge_read_time)/merge_read_iops}
+           if (($25 ==0) || (merge_write_iops == 0)){printf "0,"} else{ printf "%3.2f,",($25 - prev_merge_write_time)/merge_write_iops}
+           printf "%6.2f,%6.2f,%6.2f,%6.2f,",$33,$32,$34,$35}'
+   else
+     cat /tmp/cfsg.$my_version  | awk -v prev_save_writes="$prev_save_writes"  -v prev_merge_reads="$prev_merge_reads" -v prev_merge_writes="$prev_merge_writes" -v prev_journal_writes="$prev_journal_writes" -v prev_query_bytes="$prev_query_bytes"  -v prev_query_time="$prev_query_time"   -v prev_save_time="$prev_save_time"   -v prev_journal_time="$prev_journal_time"   -v prev_merge_read_time="$prev_merge_read_time"   -v prev_merge_write_time="$prev_merge_write_time" -v interval="$interval" ' \
+          {save_iops=($11 - prev_save_writes)/(512*1024);
+           journal_iops=($8 - prev_journal_writes)/(512*1024);
+           merge_read_iops= ($6 - prev_merge_reads)/(512*1024);
+           merge_write_iops=($7 - prev_merge_writes)/(512*1024);
+           total_write_iops=journal_iops+merge_write_iops+save_iops;
+           printf "%d\t%d\t%d\t%d\t%d\t%d\t",(total_write_iops/2)/interval,save_iops/interval,journal_iops/interval,merge_read_iops/interval,merge_write_iops/interval,total_write_iops/interval;
+           if (save_iops == 0){printf "0\t"} else{ printf "%3.2f\t",($24 - prev_save_time)/save_iops}
+           if (journal_iops == 0){printf "0\t"} else{ printf "%3.2f\t",($23 - prev_journal_time)/journal_iops}
+           if (merge_read_iops == 0){printf "0\t"} else{ printf "%3.2f\t",($26 - prev_merge_read_time)/merge_read_iops}
+           if (merge_write_iops == 0){printf "0\t"} else{ printf "%3.2f\t",($25 - prev_merge_write_time)/merge_write_iops}
+           printf "%6.2f\t%6.2f\t%6.2f\t%6.2f\t",$33,$32,$34,$35}'
+
+   fi
+fi
+
+
+printf "\n"
+sync
+
+if [ $collect_mlstats -eq 1 ]
+then
+
+prev_docs=`cat /tmp/cfsg.$my_version | awk '{print $2}'`
+prev_del=`cat /tmp/cfsg.$my_version | awk '{i=NF-1;print $i}'`
+prev_reindex=`cat /tmp/cfsg.$my_version | awk '{i=NF;print $i}'`
+prev_merge_reads=`cat /tmp/cfsg.$my_version | awk '{print $6}'`
+prev_merge_writes=`cat /tmp/cfsg.$my_version | awk '{print $7}'`
+prev_journal_writes=`cat /tmp/cfsg.$my_version | awk '{print $8}'`
+prev_save_writes=`cat /tmp/cfsg.$my_version | awk '{print $11}'`
+prev_query_bytes=`cat /tmp/cfsg.$my_version | awk '{print $12}'`
+prev_query_time=`cat /tmp/cfsg.$my_version | awk '{print $27}'`
+prev_save_time=`cat /tmp/cfsg.$my_version | awk '{print $24}'`
+prev_journal_time=`cat /tmp/cfsg.$my_version | awk '{print $23}'`
+prev_merge_read_time=`cat /tmp/cfsg.$my_version | awk '{print $26}'`
+prev_merge_write_time=`cat /tmp/cfsg.$my_version | awk '{print $25}'`
+
+prev_backup_reads=`cat /tmp/cfsg.$my_version | awk '{print $37}'`
+prev_backup_writes=`cat /tmp/cfsg.$my_version | awk '{print $38}'`
+prev_backup_write_time=`cat /tmp/cfsg.$my_version | awk '{print $41}'`
+prev_backup_read_time=`cat /tmp/cfsg.$my_version | awk '{print $42}'`
+
+prev_restore_reads=`cat /tmp/cfsg.$my_version | awk '{print $45}'`
+prev_restore_writes=`cat /tmp/cfsg.$my_version | awk '{print $46}'`
+prev_restore_read_time=`cat /tmp/cfsg.$my_version | awk '{print $50}'`
+prev_restore_write_time=`cat /tmp/cfsg.$my_version | awk '{print $49}'`
+
+prev_replication_receives=`cat /tmp/cfsg.$my_version | awk '{print $61}'`
+prev_replication_sends=`cat /tmp/cfsg.$my_version | awk '{print $65}'`
+prev_replication_receive_time=`cat /tmp/cfsg.$my_version | awk '{print $63}'`
+prev_replication_send_time=`cat /tmp/cfsg.$my_version | awk '{print $67}'`
+fi
+
+fi
+
+# This acts as the sleep as well
+vmstat $requested_interval 2 > /tmp/vms-temp.$my_version 
+#sleep $1
+
+this_sample=$(expr $this_sample + 1)
+done
+
+
+
+#if [ $timestamp_include -eq 1 ] || [ $date_timestamp_include -eq 1 ] || [ $epoch_include -eq 1 ]
+#then
+#tabs -d 1,15,23,31,39,47,55,63,71,79,87,95,103,111,119,127,135,143,151,159,167,175,183,191,199,207,215,223,231,239,247,255,263,271,279,287,295,303,311,319,327,335,343,351,359,367,375,383,391,399,407,415,423,431,439,447,455,463,471,479,487,495,503,511,519,527,535,543,551,559,567,575,583,591,599,607,615,623,631,639,647,655,663,671,679,687,695,703,711,719, > /tmp/tabs 2>&1 
+#else
+#tabs -d 1,8,16,24,32,40,48,56,64,72,80,88,96,104,112,120,128,136,144,152,160,168,176,184,192,200,208,216,224,232,240,248,256,264,272,280,288,296,304,312,320,328,336,344,352,360,368,376,384,392,400,408,416,424,432,440,448,456,464,472,480,488,496,504,512,520,528,536,544,552,560,568,576,584,592,600,608,616,624,632,640,648,656,664,672,680,688,696,704,712  > /tmp/tabs 2>&1
+#
+#fi
